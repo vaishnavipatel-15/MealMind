@@ -102,6 +102,20 @@ The app will open in your default web browser at `http://localhost:8501`.
 5.  **Manage Inventory**: Add items you already have to the **Inventory** tab to track your pantry.
 6.  **Get Suggestions**: Visit **Suggestions** to find recipes you can make with your current inventory.
 
+## 🏗️ System Architecture & Design
+
+### System Architecture
+![Basic System Architecture](Images/Basic%20System%20Architecture.png)
+The application follows a modern three-tier architecture with a Streamlit frontend, Python backend for business logic, and Snowflake as the data warehouse. This design ensures scalability, maintainability, and efficient data processing for nutrition intelligence.
+
+### Data Flow & ELT Pipeline
+![Data Flow & ELT](Images/Data%20Flow%20_%20ELT.png)
+Our Extract, Load, Transform (ELT) pipeline leverages Snowflake's computing power to process USDA nutrition data efficiently. Raw data is loaded into staging tables, then transformed using dbt models to create analytics-ready datasets for meal planning and nutritional analysis.
+
+### User Onboarding Flow
+![User Onboarding](Images/User%20Onboarding.png)
+The onboarding process guides users through profile creation, nutritional goal setting, and preference configuration. This structured flow ensures we collect all necessary information to provide personalized meal recommendations and accurate nutritional calculations.
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
