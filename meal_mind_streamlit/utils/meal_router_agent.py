@@ -17,6 +17,8 @@ class ChatRouterState(TypedDict):
     history: List[Any]
     route: Optional[Literal["meal_retrieval", "general_chat"]]
     retrieved_data: Optional[str]
+    user_preferences: Optional[Dict]  # Long-term memory
+    extracted_feedback: Optional[List[Dict]]  # New feedback from this message
     response: str
 
 # ==================== MULTI-AGENT ROUTER ====================
@@ -35,6 +37,27 @@ class MealRouterAgent:
         except Exception as e:
             st.warning(f"Chat Model initialization failed: {e}")
             self.chat_model = None
+        
+        # Initialize Feedback Agent for preference extraction
+        from utils.feedback_agent import FeedbackAgent
+        self.feedback_agent = FeedbackAgent(conn, session)
+    
+    # ==================== LOAD PREFERENCES NODE ====================
+    def node_load_preferences(self, state: ChatRouterState) -> ChatRouterState:
+        """Load user preferences from long-term memory"""
+        preferences = self.feedback_agent.get_user_preferences(state['user_id'])
+        state['user_preferences'] = preferences
+        return state
+    
+    # ==================== EXTRACT FEEDBACK NODE ====================
+    def node_extract_feedback(self, state: ChatRouterState) -> ChatRouterState:
+        """Extract preferences from user message"""
+        extracted = self.feedback_agent.extract_preferences(
+            state['user_input'], 
+            state['user_id']
+        )
+        state['extracted_feedback'] = extracted
+        return state
     
     # ==================== ROUTING NODE ====================
     def node_route_query(self, state: ChatRouterState) -> ChatRouterState:
@@ -128,6 +151,10 @@ class MealRouterAgent:
         inventory = state['inventory_summary']
         meal_plan = state['meal_plan_summary']
         history = state['history']
+        preferences = state.get('user_preferences', {})
+        
+        # Format preferences for prompt
+        pref_text = self.feedback_agent.format_preferences_for_prompt(preferences)
         
         system_prompt = f"""You are Meal Mind AI, a helpful nutrition and meal planning assistant.
 
@@ -137,6 +164,9 @@ USER PROFILE:
 - Dietary Restrictions: {user_profile.get('dietary_restrictions', 'None')}
 - Allergies: {user_profile.get('food_allergies', 'None')}
 
+USER PREFERENCES (LEARNED):
+{pref_text}
+
 CURRENT INVENTORY:
 {inventory[:500]}...
 
@@ -144,10 +174,11 @@ MEAL PLAN SUMMARY:
 {meal_plan[:300]}...
 
 YOUR ROLE:
-- Provide nutrition advice and cooking tips
+- Provide nutrition advice and cooking tips considering user preferences
 - Answer health and wellness questions
 - Be encouraging and supportive
 - Keep responses concise and helpful
+- IMPORTANT: Respect user dislikes and preferences in your suggestions
 """
         
         # Prepare messages
@@ -228,17 +259,21 @@ Generate a helpful, conversational response that:
     
     # ==================== BUILD GRAPH ====================
     def build_graph(self):
-        """Build the LangGraph workflow"""
+        """Build the LangGraph workflow with memory integration"""
         workflow = StateGraph(ChatRouterState)
         
         # Add nodes
+        workflow.add_node("load_preferences", self.node_load_preferences)
+        workflow.add_node("extract_feedback", self.node_extract_feedback)
         workflow.add_node("route_query", self.node_route_query)
         workflow.add_node("retrieve_meals", self.node_retrieve_meals)
         workflow.add_node("general_chat", self.node_general_chat)
         workflow.add_node("generate_response", self.node_generate_response)
         
-        # Add edges
-        workflow.set_entry_point("route_query")
+        # Add edges - Memory-aware workflow
+        workflow.set_entry_point("load_preferences")
+        workflow.add_edge("load_preferences", "extract_feedback")
+        workflow.add_edge("extract_feedback", "route_query")
         
         # Conditional routing after route_query
         workflow.add_conditional_edges(
@@ -272,6 +307,8 @@ Generate a helpful, conversational response that:
             history=history,
             route=None,
             retrieved_data=None,
+            user_preferences=None,
+            extracted_feedback=None,
             response=""
         )
         

@@ -151,6 +151,85 @@ def create_tables(conn):
                        )
                        """)
 
+        # Conversation Threads for Memory System
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS conversation_threads
+                       (
+                           thread_id VARCHAR(50) PRIMARY KEY,
+                           user_id VARCHAR(50) NOT NULL,
+                           title VARCHAR(255),
+                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                           last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                           message_count INT DEFAULT 0,
+                           is_active BOOLEAN DEFAULT TRUE,
+                           summary TEXT,
+                           FOREIGN KEY (user_id) REFERENCES users(user_id)
+                       )
+                       """)
+
+        # Thread Messages
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS thread_messages
+                       (
+                           message_id VARCHAR(50) PRIMARY KEY,
+                           thread_id VARCHAR(50) NOT NULL,
+                           role VARCHAR(20) NOT NULL,
+                           content TEXT NOT NULL,
+                           timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                           metadata VARIANT,
+                           FOREIGN KEY (thread_id) REFERENCES conversation_threads(thread_id)
+                       )
+                       """)
+
+        # Thread Checkpoints for LangGraph
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS thread_checkpoints
+                       (
+                           checkpoint_id VARCHAR(50) PRIMARY KEY,
+                           thread_id VARCHAR(50) NOT NULL,
+                           checkpoint_data VARIANT,
+                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                           FOREIGN KEY (thread_id) REFERENCES conversation_threads(thread_id)
+                       )
+                       """)
+
+        # User Feedback (Likes/Dislikes)
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS user_feedback
+                       (
+                           feedback_id VARCHAR(50) PRIMARY KEY,
+                           user_id VARCHAR(50) NOT NULL,
+                           feedback_type VARCHAR(50),
+                           entity_type VARCHAR(50),
+                           entity_id VARCHAR(50),
+                           entity_name VARCHAR(255),
+                           sentiment VARCHAR(20),
+                           intensity INT,
+                           context TEXT,
+                           extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                           source VARCHAR(50),
+                           FOREIGN KEY (user_id) REFERENCES users(user_id)
+                       )
+                       """)
+
+        # User Preferences (Long-term Memory)
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS user_preferences
+                       (
+                           preference_id VARCHAR(50) PRIMARY KEY,
+                           user_id VARCHAR(50) NOT NULL,
+                           preference_type VARCHAR(50),
+                           preference_key VARCHAR(255),
+                           preference_value TEXT,
+                           confidence_score FLOAT,
+                           frequency INT DEFAULT 1,
+                           last_mentioned TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                           expires_at TIMESTAMP,
+                           is_active BOOLEAN DEFAULT TRUE,
+                           FOREIGN KEY (user_id) REFERENCES users(user_id)
+                       )
+                       """)
+
         conn.commit()
         
         # Migration: Add preferred_cuisines if not exists

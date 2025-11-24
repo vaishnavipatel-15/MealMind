@@ -4,6 +4,8 @@ import pandas as pd
 from datetime import datetime
 from utils.helpers import generate_new_meal_plan
 from utils.ui import show_meal_details
+from utils.feedback_agent import FeedbackAgent
+from utils.db import get_snowpark_session
 
 def render_meal_plan(conn, user_id):
     """Enhanced meal plan viewer"""
@@ -225,5 +227,66 @@ def render_meal_plan(conn, user_id):
                 
                 if meal_key in meal_map:
                     show_meal_details(meal_map[meal_key])
+            
+            # Meal Feedback Section
+            st.divider()
+            st.subheader("💭 Rate Your Meals")
+            st.caption("Help us learn your preferences by rating each meal")
+            
+            # Initialize feedback agent
+            session = get_snowpark_session()
+            feedback_agent = FeedbackAgent(conn, session)
+            
+            # Display feedback buttons for each meal
+            for idx, meal in enumerate(meal_details):
+                meal_type = meal[0]
+                meal_name = meal[1]
+                
+                col1, col2, col3, col4 = st.columns([0.4, 0.3, 0.1, 0.1])
+                
+                with col1:
+                    st.markdown(f"**{meal_type.title()}:** {meal_name}")
+                
+                with col2:
+                    # Parse nutrition for calories display
+                    if meal[4]:
+                        nut = json.loads(meal[4])
+                        st.caption(f"{nut.get('calories', 0):.0f} kcal")
+                
+                with col3:
+                    if st.button("👍", key=f"like_meal_{meal_id}_{idx}", help="I like this meal"):
+                        # Save feedback for the meal with ingredients in context
+                        ingredients_list = []
+                        if meal[2]:  # ingredients_with_quantities
+                            ingredients = json.loads(meal[2]) if isinstance(meal[2], str) else meal[2]
+                            ingredients_list = [ing.get('ingredient', '') for ing in ingredients[:5]]
+                        
+                        # Use shorter entity_id - just meal type + index
+                        feedback_agent.save_explicit_feedback(
+                            user_id=user_id,
+                            entity_id=f"{meal_type}_{idx}",
+                            entity_name=meal_name,
+                            entity_type="meal",
+                            feedback="like"
+                        )
+                        st.success("✓ Saved!", icon="👍")
+                
+                with col4:
+                    if st.button("👎", key=f"dislike_meal_{meal_id}_{idx}", help="I don't like this meal"):
+                        # Save feedback for the meal with ingredients in context
+                        ingredients_list = []
+                        if meal[2]:
+                            ingredients = json.loads(meal[2]) if isinstance(meal[2], str) else meal[2]
+                            ingredients_list = [ing.get('ingredient', '') for ing in ingredients[:5]]
+                        
+                        # Use shorter entity_id - just meal type + index
+                        feedback_agent.save_explicit_feedback(
+                            user_id=user_id,
+                            entity_id=f"{meal_type}_{idx}",
+                            entity_name=meal_name,
+                            entity_type="meal",
+                            feedback="dislike"
+                        )
+                        st.warning("✓ Noted", icon="👎")
 
     cursor.close()

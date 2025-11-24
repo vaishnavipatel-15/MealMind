@@ -1,6 +1,8 @@
 import streamlit as st
 from utils.meal_router_agent import MealRouterAgent
 from utils.db import get_user_profile, get_user_inventory, get_latest_meal_plan, get_snowpark_session
+from utils.thread_manager import ThreadManager
+from utils.feedback_agent import FeedbackAgent
 from langchain.schema import HumanMessage, AIMessage
 import time
 
@@ -41,30 +43,86 @@ def render_chat(conn, user_id):
         </style>
     """, unsafe_allow_html=True)
     
-    # Header with better styling
-    col1, col2 = st.columns([0.9, 0.1])
+    # Thread Management
+    thread_mgr = ThreadManager(conn)
+    
+    # Initialize current thread
+    if "current_thread_id" not in st.session_state:
+        # Create first thread
+        thread_id = thread_mgr.create_thread(user_id)
+        st.session_state.current_thread_id = thread_id
+    
+    # Thread Selector UI
+    threads = thread_mgr.get_user_threads(user_id, limit=3)
+    
+    col1, col2, col3 = st.columns([0.6, 0.3, 0.1])
     with col1:
         st.title("💬 Chat with Meal Mind")
-        st.caption("🤖 Ask questions about your meal plan, inventory, or get personalized cooking tips!")
     with col2:
-        if st.button("🗑️", help="Clear chat history"):
+        if threads:
+            thread_options = {t['thread_id']: t['title'] for t in threads}
+            selected = st.selectbox(
+                "Conversation",
+                options=list(thread_options.keys()),
+                format_func=lambda x: thread_options[x][:30] + "...",
+                index=0,
+                label_visibility="collapsed"
+            )
+            if selected != st.session_state.current_thread_id:
+                st.session_state.current_thread_id = selected
+                # Load messages from database for selected thread
+                db_messages = thread_mgr.get_thread_messages(selected)
+                st.session_state.messages = []
+                for msg in db_messages:
+                    if msg['role'] == 'user':
+                        st.session_state.messages.append(HumanMessage(content=msg['content']))
+                    else:
+                        st.session_state.messages.append(AIMessage(content=msg['content']))
+                # Add welcome message if no messages
+                if not st.session_state.messages:
+                    st.session_state.messages = [
+                        AIMessage(content="Hello! I'm Meal Mind. How can I help you with your nutrition today?")
+                    ]
+                st.rerun()
+    with col3:
+        if st.button("➕", help="New conversation"):
+            new_thread = thread_mgr.create_thread(user_id)
+            st.session_state.current_thread_id = new_thread
             st.session_state.messages = [
                 AIMessage(content="Hello! I'm Meal Mind. How can I help you with your nutrition today?")
             ]
             st.rerun()
-
+    
+    st.caption("🤖 Ask questions about your meal plan, inventory, or get personalized cooking tips!")
     st.divider()
 
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            AIMessage(content="Hello! I'm Meal Mind. How can I help you with your nutrition today?")
-        ]
+    # Initialize chat history from database
+    if "messages" not in st.session_state or len(st.session_state.messages) == 0:
+        # Load messages from current thread
+        if st.session_state.current_thread_id:
+            db_messages = thread_mgr.get_thread_messages(st.session_state.current_thread_id)
+            st.session_state.messages = []
+            for msg in db_messages:
+                if msg['role'] == 'user':
+                    st.session_state.messages.append(HumanMessage(content=msg['content']))
+                else:
+                    st.session_state.messages.append(AIMessage(content=msg['content']))
+        
+        # Add welcome message if no messages loaded
+        if not st.session_state.messages:
+            st.session_state.messages = [
+                AIMessage(content="Hello! I'm Meal Mind. How can I help you with your nutrition today?")
+            ]
 
     # Initialize Chat Agent with Router
     if "chat_agent" not in st.session_state:
         session = get_snowpark_session()
         st.session_state.chat_agent = MealRouterAgent(session, conn)
+
+    # Initialize Feedback Agent
+    if "feedback_agent" not in st.session_state:
+        session = get_snowpark_session()
+        st.session_state.feedback_agent = FeedbackAgent(conn, session)
 
     # Create a container for messages
     message_container = st.container(height=500)
@@ -78,11 +136,42 @@ def render_chat(conn, user_id):
             elif isinstance(msg, AIMessage):
                 with st.chat_message("assistant", avatar="🤖"):
                     st.markdown(msg.content)
+                    
+                    # Add feedback buttons (only for AI messages, not the welcome message)
+                    if i > 0:  # Skip welcome message
+                        col1, col2, col3 = st.columns([0.1, 0.1, 0.8])
+                        with col1:
+                            if st.button("👍", key=f"like_{i}", help="I like this response"):
+                                st.session_state.feedback_agent.save_explicit_feedback(
+                                    user_id=user_id,
+                                    entity_id=f"msg_{i}",
+                                    entity_name=f"Response about: {st.session_state.messages[i-1].content[:30]}...",
+                                    entity_type="ai_response",
+                                    feedback="like"
+                                )
+                                st.success("Thanks for the feedback!")
+                        with col2:
+                            if st.button("👎", key=f"dislike_{i}", help="I don't like this response"):
+                                st.session_state.feedback_agent.save_explicit_feedback(
+                                    user_id=user_id,
+                                    entity_id=f"msg_{i}",
+                                    entity_name=f"Response about: {st.session_state.messages[i-1].content[:30]}...",
+                                    entity_type="ai_response",
+                                    feedback="dislike"
+                                )
+                                st.warning("Thanks for the feedback! We'll improve.")
 
     # Chat Input
     if prompt := st.chat_input("What would you like to know?", key="chat_input"):
         # Add user message to state
         st.session_state.messages.append(HumanMessage(content=prompt))
+        
+        # Persist user message to database
+        thread_mgr.add_message(
+            thread_id=st.session_state.current_thread_id,
+            role="user",
+            content=prompt
+        )
         
         # Display user message immediately
         with message_container:
@@ -138,6 +227,21 @@ def render_chat(conn, user_id):
             
             # Add assistant response to state
             st.session_state.messages.append(AIMessage(content=full_response))
+            
+            # Persist assistant message to database
+            thread_mgr.add_message(
+                thread_id=st.session_state.current_thread_id,
+                role="assistant",
+                content=full_response
+            )
+            
+            # Generate thread title if this is the first user message
+            if len(st.session_state.messages) == 3:  # Welcome + user + assistant
+                thread_mgr.generate_thread_title(
+                    thread_id=st.session_state.current_thread_id,
+                    first_message=prompt,
+                    use_llm=True
+                )
             
         except Exception as e:
             with message_container:

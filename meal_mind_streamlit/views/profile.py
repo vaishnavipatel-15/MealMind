@@ -1,5 +1,7 @@
 import streamlit as st
 from utils.api import calculate_nutrition_targets
+from utils.feedback_agent import FeedbackAgent
+from utils.db import get_snowpark_session
 
 def render_profile(conn, user_id):
     st.header("⚙️ Update Profile")
@@ -116,3 +118,74 @@ def render_profile(conn, user_id):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error updating profile: {e}")
+    
+    # Learned Preferences Section
+    st.divider()
+    st.header("🧠 Learned Preferences")
+    st.caption("Automatically tracked from your conversations")
+    
+    # Get feedback agent
+    session = get_snowpark_session()
+    feedback_agent = FeedbackAgent(conn, session)
+    
+    # Fetch user preferences
+    preferences = feedback_agent.get_user_preferences(user_id)
+    
+    # Display in tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["👍 Likes", "👎 Dislikes", "🍽️ Cuisines", "🥗 Dietary"])
+    
+    with tab1:
+        if preferences.get('likes'):
+            for pref in preferences['likes']:
+                col1, col2, col3 = st.columns([0.5, 0.3, 0.2])
+                with col1:
+                    st.markdown(f"**{pref['name'].title()}**")
+                with col2:
+                    confidence = int(pref.get('confidence', 0) * 100)
+                    st.progress(confidence / 100, text=f"{confidence}%")
+                with col3:
+                    st.caption(f"×{pref.get('frequency', 1)}")
+        else:
+            st.info("No likes recorded yet. Chat with Meal Mind and mention foods you enjoy!")
+    
+    with tab2:
+        if preferences.get('dislikes'):
+            for pref in preferences['dislikes']:
+                col1, col2, col3 = st.columns([0.5, 0.3, 0.2])
+                with col1:
+                    st.markdown(f"**{pref['name'].title()}**")
+                with col2:
+                    confidence = int(pref.get('confidence', 0) * 100)
+                    st.progress(confidence / 100, text=f"{confidence}%")
+                with col3:
+                    st.caption(f"×{pref.get('frequency', 1)}")
+        else:
+            st.info("No dislikes recorded yet. Mention foods you avoid in conversations!")
+    
+    with tab3:
+        if preferences.get('cuisines'):
+            for pref in preferences['cuisines']:
+                col1, col2, col3 = st.columns([0.5, 0.3, 0.2])
+                with col1:
+                    st.markdown(f"**{pref['name'].title()}**")
+                with col2:
+                    confidence = int(pref.get('confidence', 0) * 100)
+                    st.progress(confidence / 100, text=f"{confidence}%")
+                with col3:
+                    st.caption(f"×{pref.get('frequency', 1)}")
+        else:
+            st.info("No cuisine preferences yet. Tell us what you want to try!")
+    
+    with tab4:
+        if preferences.get('dietary'):
+            for pref in preferences['dietary']:
+                col1, col2, col3 = st.columns([0.5, 0.3, 0.2])
+                with col1:
+                    st.markdown(f"**{pref['name'].title()}**")
+                with col2:
+                    confidence = int(pref.get('confidence', 0) * 100)
+                    st.progress(confidence / 100, text=f"{confidence}%")
+                with col3:
+                    st.caption(f"×{pref.get('frequency', 1)}")
+        else:
+            st.info("No dietary preferences learned yet.")
