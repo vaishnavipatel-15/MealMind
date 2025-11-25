@@ -595,3 +595,158 @@ def search_meals_by_ingredient(conn, user_id, ingredient_name):
     finally:
         cursor.close()
 
+
+def get_daily_meal_id(conn, user_id, date):
+    """Get the meal_id (daily record) for a specific date"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT meal_id 
+            FROM daily_meals 
+            WHERE user_id = %s AND meal_date = %s
+        """, (user_id, date))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        st.error(f"Error fetching daily meal ID: {e}")
+        return None
+    finally:
+        cursor.close()
+
+
+def get_meal_detail_id(conn, daily_meal_id, meal_type):
+    """Get the detail_id for a specific meal type on a specific day"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT detail_id 
+            FROM meal_details 
+            WHERE meal_id = %s AND meal_type = %s
+        """, (daily_meal_id, meal_type))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        st.error(f"Error fetching meal detail ID: {e}")
+        return None
+    finally:
+        cursor.close()
+
+def get_meal_detail_by_id(conn, detail_id):
+    """Get full meal details by detail_id"""
+    import json
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT 
+                meal_name,
+                ingredients_with_quantities,
+                recipe,
+                nutrition,
+                preparation_time,
+                cooking_time,
+                servings,
+                difficulty_level
+            FROM meal_details 
+            WHERE detail_id = %s
+        """, (detail_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            return {
+                'meal_name': row[0],
+                'ingredients_with_quantities': json.loads(row[1]) if row[1] else [],
+                'recipe': json.loads(row[2]) if row[2] else {},
+                'nutrition': json.loads(row[3]) if row[3] else {},
+                'preparation_time': row[4],
+                'cooking_time': row[5],
+                'servings': row[6],
+                'difficulty_level': row[7]
+            }
+        return None
+    except Exception as e:
+        st.error(f"Error fetching meal detail: {e}")
+        return None
+    finally:
+        cursor.close()
+
+
+def update_meal_detail(conn, detail_id, meal_data):
+    """Update a specific meal's details (recipe, nutrition, etc.)"""
+    import json
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            UPDATE meal_details 
+            SET meal_name = %s,
+                ingredients_with_quantities = PARSE_JSON(%s),
+                recipe = PARSE_JSON(%s),
+                nutrition = PARSE_JSON(%s),
+                preparation_time = %s,
+                cooking_time = %s,
+                servings = %s,
+                difficulty_level = %s
+            WHERE detail_id = %s
+        """, (
+            meal_data.get('meal_name'),
+            json.dumps(meal_data.get('ingredients_with_quantities', [])),
+            json.dumps(meal_data.get('recipe', {})),
+            json.dumps(meal_data.get('nutrition', {})),
+            meal_data.get('preparation_time', 0),
+            meal_data.get('cooking_time', 0),
+            meal_data.get('servings', 1),
+            meal_data.get('difficulty_level', 'medium'),
+            detail_id
+        ))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Error updating meal detail: {e}")
+        return False
+    finally:
+        cursor.close()
+
+
+def get_all_meal_details_for_day(conn, daily_meal_id):
+    """Get all meal details for a specific day to recalculate totals"""
+    import json
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT nutrition 
+            FROM meal_details 
+            WHERE meal_id = %s
+        """, (daily_meal_id,))
+        rows = cursor.fetchall()
+        
+        meals_nutrition = []
+        for row in rows:
+            if row[0]:
+                try:
+                    meals_nutrition.append(json.loads(row[0]) if isinstance(row[0], str) else row[0])
+                except:
+                    pass
+        return meals_nutrition
+    except Exception as e:
+        st.error(f"Error fetching daily meals for recalculation: {e}")
+        return []
+    finally:
+        cursor.close()
+
+
+def update_daily_nutrition(conn, daily_meal_id, total_nutrition):
+    """Update the total nutrition for a day"""
+    import json
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            UPDATE daily_meals 
+            SET total_nutrition = PARSE_JSON(%s)
+            WHERE meal_id = %s
+        """, (json.dumps(total_nutrition), daily_meal_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Error updating daily nutrition: {e}")
+        return False
+    finally:
+        cursor.close()

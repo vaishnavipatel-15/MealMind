@@ -1,0 +1,10 @@
+streamlit
+snowflake-connector-python
+snowflake-snowpark-python
+python-dotenv
+pandas
+langchain
+langchain-community
+langgraph
+pydantic
+langchain-snowflake
