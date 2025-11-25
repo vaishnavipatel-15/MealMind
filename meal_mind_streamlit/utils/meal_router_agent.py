@@ -15,11 +15,13 @@ class ChatRouterState(TypedDict):
     inventory_summary: str
     meal_plan_summary: str
     history: List[Any]
-    route: Optional[Literal["meal_retrieval", "general_chat", "calorie_estimation"]]
+    route: Optional[Literal["meal_retrieval", "general_chat", "calorie_estimation", "meal_adjustment"]]
     retrieved_data: Optional[str]
     user_preferences: Optional[Dict]  # Long-term memory
     extracted_feedback: Optional[List[Dict]]  # New feedback from this message
     response: str
+    adjustment_result: Optional[Dict] # Result from adjustment agent
+    monitoring_warnings: Optional[List[str]] # Warnings from monitoring agent
 
 # ==================== MULTI-AGENT ROUTER ====================
 class MealRouterAgent:
@@ -39,9 +41,14 @@ class MealRouterAgent:
             st.warning(f"Chat Model initialization failed: {e}")
             self.chat_model = None
         
-        # Initialize Feedback Agent for preference extraction
+        # Initialize Agents
         from utils.feedback_agent import FeedbackAgent
+        from utils.meal_adjustment_agent import MealAdjustmentAgent
+        from utils.monitoring_agent import MonitoringAgent
+        
         self.feedback_agent = FeedbackAgent(conn, session)
+        self.adjustment_agent = MealAdjustmentAgent(session, conn)
+        self.monitoring_agent = MonitoringAgent(conn)
     
     # ==================== LOAD PREFERENCES NODE ====================
     def node_load_preferences(self, state: ChatRouterState) -> ChatRouterState:
@@ -76,16 +83,38 @@ class MealRouterAgent:
         
         # Keywords for calorie estimation
         estimation_keywords = [
-            'estimate', 'calculate', 'buffet', 'restaurant', 'ate', 'eating',
-            'how many calories in', 'nutritional info for'
+            'estimate', 'calculate', 'how many calories in', 'nutritional info for'
         ]
         
-        # Check for estimation intent first (specific overrides)
-        if any(keyword in user_input for keyword in estimation_keywords) and not ('my plan' in user_input or 'my meal' in user_input):
+        # Keywords for meal adjustment/reporting
+        adjustment_keywords = [
+            'change', 'replace', 'swap', 'instead', 'don\'t want', 'ate', 'had', 'went to', 
+            'buffet', 'restaurant', 'eaten', 'drank', 'consumed'
+        ]
+        
+        # Check for adjustment/reporting first
+        # We need to be careful not to catch questions like "What did I have?"
+        is_adjustment_intent = False
+        if any(keyword in user_input for keyword in adjustment_keywords) and \
+           any(meal in user_input for meal in ['breakfast', 'lunch', 'dinner', 'snack', 'meal']):
+            is_adjustment_intent = True
+            
+            # Exception: If it's a question containing "what", it's likely retrieval
+            # unless it explicitly asks to change/replace
+            if 'what' in user_input and not any(k in user_input for k in ['change', 'replace', 'swap', 'add', 'instead']):
+                is_adjustment_intent = False
+
+        if is_adjustment_intent:
+            state['route'] = 'meal_adjustment'
+            
+        # Check for estimation intent
+        elif any(keyword in user_input for keyword in estimation_keywords) and not ('my plan' in user_input or 'my meal' in user_input):
             state['route'] = 'calorie_estimation'
+            
         # Then check for retrieval
         elif any(keyword in user_input for keyword in meal_keywords):
             state['route'] = 'meal_retrieval'
+            
         else:
             state['route'] = 'general_chat'
         
@@ -154,6 +183,40 @@ class MealRouterAgent:
         
         return state
     
+    # ==================== MEAL ADJUSTMENT NODE ====================
+    def node_adjust_meal(self, state: ChatRouterState) -> ChatRouterState:
+        """Handle meal changes and restaurant entries"""
+        user_input = state['user_input'].lower()
+        user_id = state['user_id']
+        
+        # Identify meal type and date (default to today)
+        meal_type = 'lunch' # Default
+        if 'breakfast' in user_input: meal_type = 'breakfast'
+        elif 'dinner' in user_input: meal_type = 'dinner'
+        elif 'snack' in user_input: meal_type = 'snacks'
+        
+        date = datetime.now().strftime('%Y-%m-%d')
+        # Simple date logic for now, could be enhanced
+        
+        result = self.adjustment_agent.process_request(
+            user_input, user_id, date, meal_type
+        )
+        
+        state['adjustment_result'] = result
+        return state
+
+    # ==================== MONITORING NODE ====================
+    def node_monitor_changes(self, state: ChatRouterState) -> ChatRouterState:
+        """Monitor changes and generate warnings"""
+        if state.get('adjustment_result', {}).get('status') == 'success':
+            user_id = state['user_id']
+            date = datetime.now().strftime('%Y-%m-%d')
+            
+            warnings = self.monitoring_agent.monitor_changes(user_id, date)
+            state['monitoring_warnings'] = warnings
+            
+        return state
+
     # ==================== GENERAL CHAT NODE ====================
     def node_general_chat(self, state: ChatRouterState) -> ChatRouterState:
         """Handle general nutrition and cooking questions"""
@@ -195,7 +258,21 @@ YOUR ROLE:
         messages = [SystemMessage(content=system_prompt)]
         
         # Add history (last 5 messages)
-        for msg in history[-5:]:
+        # Filter history to ensure valid sequence (System -> User -> AI -> User...)
+        # specifically, we cannot have System -> AI. The first history msg must be Human.
+        
+        recent_history = history[-5:]
+        start_index = 0
+        
+        # Skip leading AI messages in the history chunk
+        for i, msg in enumerate(recent_history):
+            if isinstance(msg, HumanMessage):
+                start_index = i
+                break
+            if i == len(recent_history) - 1:
+                start_index = len(recent_history) # Skip all if no HumanMessage found
+        
+        for msg in recent_history[start_index:]:
             messages.append(msg)
         
         # Add current query
@@ -252,7 +329,32 @@ Format the output using Markdown:
     def node_generate_response(self, state: ChatRouterState) -> ChatRouterState:
         """Generate final response using retrieved data if available"""
         
-        # If we have retrieved meal data, use it to generate response
+        # Case 1: Adjustment Result
+        if state.get('adjustment_result'):
+            result = state['adjustment_result']
+            warnings = state.get('monitoring_warnings', [])
+            
+            if result['status'] == 'success':
+                response = f"✅ {result['message']}\n\n"
+                response += "**New Daily Total:**\n"
+                totals = result['new_daily_total']
+                response += f"- Calories: {totals['calories']} kcal\n"
+                response += f"- Protein: {totals['protein']}g\n"
+                response += f"- Carbs: {totals['carbohydrates']}g\n"
+                response += f"- Fat: {totals['fat']}g\n"
+                response += f"- Fiber: {totals['fiber']}g\n"
+                
+                if warnings:
+                    response += "\n**Health Alerts:**\n"
+                    for w in warnings:
+                        response += f"{w}\n"
+            else:
+                response = f"❌ {result['message']}"
+                
+            state['response'] = response
+            return state
+
+        # Case 2: Retrieved Meal Data
         if state.get('retrieved_data'):
             user_profile = state['user_profile']
             
@@ -295,15 +397,10 @@ Generate a helpful, conversational response that:
             return 'retrieve_meals'
         elif state['route'] == 'calorie_estimation':
             return 'estimate_calories'
+        elif state['route'] == 'meal_adjustment':
+            return 'adjust_meal'
         else:
             return 'general_chat'
-    
-    def should_generate_response(self, state: ChatRouterState) -> str:
-        """Check if we need to generate response or already have it"""
-        if state['route'] == 'meal_retrieval':
-            return 'generate_response'
-        else:
-            return 'end'
     
     # ==================== BUILD GRAPH ====================
     def build_graph(self):
@@ -316,6 +413,8 @@ Generate a helpful, conversational response that:
         workflow.add_node("route_query", self.node_route_query)
         workflow.add_node("retrieve_meals", self.node_retrieve_meals)
         workflow.add_node("estimate_calories", self.node_estimate_calories)
+        workflow.add_node("adjust_meal", self.node_adjust_meal)
+        workflow.add_node("monitor_changes", self.node_monitor_changes)
         workflow.add_node("general_chat", self.node_general_chat)
         workflow.add_node("generate_response", self.node_generate_response)
         
@@ -331,14 +430,19 @@ Generate a helpful, conversational response that:
             {
                 "retrieve_meals": "retrieve_meals",
                 "estimate_calories": "estimate_calories",
+                "adjust_meal": "adjust_meal",
                 "general_chat": "general_chat"
             }
         )
         
-        # After retrieve_meals, generate response
+        # Meal Adjustment Flow
+        workflow.add_edge("adjust_meal", "monitor_changes")
+        workflow.add_edge("monitor_changes", "generate_response")
+        
+        # Meal Retrieval Flow
         workflow.add_edge("retrieve_meals", "generate_response")
         
-        # After generate_response or general_chat, end
+        # End points
         workflow.add_edge("generate_response", END)
         workflow.add_edge("general_chat", END)
         workflow.add_edge("estimate_calories", END)
@@ -360,7 +464,9 @@ Generate a helpful, conversational response that:
             retrieved_data=None,
             user_preferences=None,
             extracted_feedback=None,
-            response=""
+            response="",
+            adjustment_result=None,
+            monitoring_warnings=None
         )
         
         app = self.build_graph()
@@ -378,3 +484,4 @@ Generate a helpful, conversational response that:
         words = full_response.split()
         for i, word in enumerate(words):
             yield word + (" " if i < len(words) - 1 else "")
+
