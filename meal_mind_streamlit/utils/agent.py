@@ -3,7 +3,7 @@ import json
 import re
 from typing import Dict, Any, Optional, List, TypedDict
 from langchain_community.chat_models import ChatSnowflakeCortex
-from langchain_snowflake.agents import SnowflakeCortexAgent
+from langchain_snowflake import SnowflakeCortexAgent
 from langchain.schema import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from datetime import datetime, timedelta

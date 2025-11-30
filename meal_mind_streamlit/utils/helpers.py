@@ -213,6 +213,61 @@ def delete_inventory_item(conn, inventory_id):
         return False
 
 
+def update_inventory_quantity(conn, user_id, item_name, quantity_change):
+    """Update inventory quantity by adding or subtracting
+    
+    Args:
+        conn: Database connection
+        user_id: User ID
+        item_name: Name of the item to update
+        quantity_change: Amount to add (positive) or subtract (negative)
+    
+    Returns:
+        tuple: (success: bool, new_quantity: float or None, message: str)
+    """
+    cursor = conn.cursor()
+    
+    try:
+        # Find the item (case-insensitive search)
+        cursor.execute("""
+            SELECT inventory_id, quantity, unit
+            FROM inventory
+            WHERE user_id = %s AND LOWER(item_name) = LOWER(%s)
+            LIMIT 1
+        """, (user_id, item_name))
+        
+        result = cursor.fetchone()
+        
+        if not result:
+            cursor.close()
+            return (False, None, f"Item '{item_name}' not found in inventory")
+        
+        inventory_id, current_quantity, unit = result
+        new_quantity = current_quantity + quantity_change
+        
+        # If quantity becomes zero or negative, delete the item
+        if new_quantity <= 0:
+            cursor.execute("DELETE FROM inventory WHERE inventory_id = %s", (inventory_id,))
+            conn.commit()
+            cursor.close()
+            return (True, 0, f"Removed all {item_name} from inventory (used {abs(quantity_change)} {unit})")
+        
+        # Otherwise, update the quantity
+        cursor.execute("""
+            UPDATE inventory
+            SET quantity = %s, updated_at = CURRENT_TIMESTAMP()
+            WHERE inventory_id = %s
+        """, (new_quantity, inventory_id))
+        
+        conn.commit()
+        cursor.close()
+        return (True, new_quantity, f"Updated {item_name}: {current_quantity} → {new_quantity} {unit}")
+        
+    except Exception as e:
+        cursor.close()
+        return (False, None, f"Database error: {str(e)}")
+
+
 def update_plan_suggestions(conn, plan_id, suggestions):
     """Update the week_summary with new suggestions"""
     cursor = conn.cursor()
