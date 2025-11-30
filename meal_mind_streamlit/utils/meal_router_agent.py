@@ -5,6 +5,8 @@ from langchain.schema import HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, END
 import json
 import re
+import os
+import requests
 from datetime import datetime
 
 # ==================== LANGGRAPH STATE ====================
@@ -15,13 +17,15 @@ class ChatRouterState(TypedDict):
     inventory_summary: str
     meal_plan_summary: str
     history: List[Any]
-    route: Optional[Literal["meal_retrieval", "general_chat", "calorie_estimation", "meal_adjustment"]]
+    route: Optional[Literal["meal_retrieval", "general_chat", "calorie_estimation", "meal_adjustment", "inventory_modification"]]
     retrieved_data: Optional[str]
-    user_preferences: Optional[Dict]  # Long-term memory
-    extracted_feedback: Optional[List[Dict]]  # New feedback from this message
+    user_preferences: Optional[Dict]
+    extracted_feedback: Optional[List[Dict]]
     response: str
-    adjustment_result: Optional[Dict] # Result from adjustment agent
-    monitoring_warnings: Optional[List[str]] # Warnings from monitoring agent
+    adjustment_result: Optional[Dict]
+    monitoring_warnings: Optional[List[str]]
+    inventory_result: Optional[Dict]
+    inventory_response: Optional[str]
 
 # ==================== MULTI-AGENT ROUTER ====================
 class MealRouterAgent:
@@ -31,7 +35,6 @@ class MealRouterAgent:
         self.session = session
         self.conn = conn
         try:
-            # Initialize Cortex Chat Model for routing and responses
             self.chat_model = ChatSnowflakeCortex(
                 session=self.session,
                 model="llama3.1-70b",
@@ -41,7 +44,6 @@ class MealRouterAgent:
             st.warning(f"Chat Model initialization failed: {e}")
             self.chat_model = None
         
-        # Initialize Agents
         from utils.feedback_agent import FeedbackAgent
         from utils.meal_adjustment_agent import MealAdjustmentAgent
         from utils.monitoring_agent import MonitoringAgent
@@ -67,12 +69,23 @@ class MealRouterAgent:
         state['extracted_feedback'] = extracted
         return state
     
-    # ==================== ROUTING NODE ====================
     def node_route_query(self, state: ChatRouterState) -> ChatRouterState:
         """Analyze user query and determine which agent to route to"""
         user_input = state['user_input'].lower()
         
-        # Keywords for meal retrieval
+        # Keywords that indicate MODIFICATION of inventory
+        inventory_modification_keywords = [
+            'bought', 'added', 'got', 'purchased', 'add', 'buy',
+            'used', 'consumed', 'ate', 'removed', 'delete', 'remove',
+            'swap', 'replace', 'substitute', 'exchange', 'update',
+            'drank', 'drunk', 'finished'
+        ]
+        
+        # Keywords that indicate VIEWING inventory
+        inventory_view_keywords = [
+            'what', 'show', 'list', 'see', 'view', 'check', 'tell me'
+        ]
+        
         meal_keywords = [
             'meal', 'recipe', 'breakfast', 'lunch', 'dinner', 'snack',
             'what am i eating', 'what should i eat', 'meal plan',
@@ -81,40 +94,50 @@ class MealRouterAgent:
             'ingredient', 'what can i make', 'show me', 'get me'
         ]
         
-        # Keywords for calorie estimation
         estimation_keywords = [
             'estimate', 'calculate', 'how many calories in', 'nutritional info for'
         ]
         
-        # Keywords for meal adjustment/reporting
         adjustment_keywords = [
             'change', 'replace', 'swap', 'instead', 'don\'t want', 'ate', 'had', 'went to', 
             'buffet', 'restaurant', 'eaten', 'drank', 'consumed'
         ]
         
-        # Check for adjustment/reporting first
-        # We need to be careful not to catch questions like "What did I have?"
         is_adjustment_intent = False
         if any(keyword in user_input for keyword in adjustment_keywords) and \
            any(meal in user_input for meal in ['breakfast', 'lunch', 'dinner', 'snack', 'meal']):
             is_adjustment_intent = True
             
-            # Exception: If it's a question containing "what", it's likely retrieval
-            # unless it explicitly asks to change/replace
             if 'what' in user_input and not any(k in user_input for k in ['change', 'replace', 'swap', 'add', 'instead']):
                 is_adjustment_intent = False
+        
+        # Check for inventory intent
+        has_inventory_word = 'inventory' in user_input or 'stock' in user_input or 'ingredients' in user_input
+        is_modification = any(keyword in user_input for keyword in inventory_modification_keywords)
+        is_viewing = any(keyword in user_input for keyword in inventory_view_keywords)
+        
+        # If it mentions inventory AND has modification keywords (but NOT viewing keywords), route to modification
+        if has_inventory_word and is_modification and not is_viewing:
+            state['route'] = 'inventory_modification'
+            return state
+        
+        # If it mentions inventory with viewing keywords, route to general_chat
+        if has_inventory_word and is_viewing:
+            state['route'] = 'general_chat'
+            return state
+        
+        # NEW: If it has modification keywords WITHOUT meal context, assume inventory modification
+        # (e.g., "I bought apples", "I added chicken")
+        if is_modification and not any(meal in user_input for meal in ['breakfast', 'lunch', 'dinner', 'snack', 'meal']):
+            state['route'] = 'inventory_modification'
+            return state
 
         if is_adjustment_intent:
             state['route'] = 'meal_adjustment'
-            
-        # Check for estimation intent
         elif any(keyword in user_input for keyword in estimation_keywords) and not ('my plan' in user_input or 'my meal' in user_input):
             state['route'] = 'calorie_estimation'
-            
-        # Then check for retrieval
         elif any(keyword in user_input for keyword in meal_keywords):
             state['route'] = 'meal_retrieval'
-            
         else:
             state['route'] = 'general_chat'
         
@@ -129,7 +152,6 @@ class MealRouterAgent:
         user_id = state['user_id']
         
         try:
-            # Extract meal type from query
             meal_type = None
             if 'breakfast' in user_input:
                 meal_type = 'breakfast'
@@ -140,7 +162,6 @@ class MealRouterAgent:
             elif 'snack' in user_input:
                 meal_type = 'snacks'
             
-            # Extract day from query
             days_map = {
                 'monday': 1, 'tuesday': 2, 'wednesday': 3, 'thursday': 4,
                 'friday': 5, 'saturday': 6, 'sunday': 7,
@@ -153,11 +174,9 @@ class MealRouterAgent:
                     day_number = day_num
                     break
             
-            # Query database
             meals = get_meals_by_criteria(self.conn, user_id, day_number, meal_type)
             
             if meals:
-                # Format the retrieved data
                 formatted_data = "## Retrieved Meals\n\n"
                 for meal in meals:
                     formatted_data += f"**{meal.get('meal_name', 'Unknown')}** ({meal.get('meal_type', '').title()})\n"
@@ -189,20 +208,192 @@ class MealRouterAgent:
         user_input = state['user_input'].lower()
         user_id = state['user_id']
         
-        # Identify meal type and date (default to today)
-        meal_type = 'lunch' # Default
+        meal_type = 'lunch'
         if 'breakfast' in user_input: meal_type = 'breakfast'
         elif 'dinner' in user_input: meal_type = 'dinner'
         elif 'snack' in user_input: meal_type = 'snacks'
         
         date = datetime.now().strftime('%Y-%m-%d')
-        # Simple date logic for now, could be enhanced
         
         result = self.adjustment_agent.process_request(
             user_input, user_id, date, meal_type
         )
         
         state['adjustment_result'] = result
+        return state
+
+    # ==================== INVENTORY MODIFICATION NODE ====================
+    def node_modify_inventory(self, state: ChatRouterState) -> ChatRouterState:
+        """Handle inventory modifications via LLM parsing and database updates"""
+        from utils.helpers import add_inventory_item, update_inventory_quantity
+        
+        user_input = state['user_input']
+        user_id = state['user_id']
+        
+        try:
+            # Use LLM to parse the user's intent and extract inventory items
+            system_prompt = """You are an inventory management assistant. Parse the user's message and extract inventory modifications.
+
+Return a JSON object with this structure:
+{
+    "action": "add" or "remove" or "swap",
+    "items": [
+        {
+            "name": "item name",
+            "quantity": number,
+            "unit": "unit (kg, g, pieces, etc.)",
+            "category": "category (Produce, Dairy, Meat, etc.)"
+        }
+    ],
+    "swap_from": "old item name" (only for swap action),
+    "swap_to": "new item name" (only for swap action)
+}
+
+Examples:
+- "I bought 2kg of apples" -> {"action": "add", "items": [{"name": "apples", "quantity": 2, "unit": "kg", "category": "Produce"}]}
+- "I used 500g of chicken" -> {"action": "remove", "items": [{"name": "chicken", "quantity": 500, "unit": "g", "category": "Meat"}]}
+- "I ate 3 apples" -> {"action": "remove", "items": [{"name": "apples", "quantity": 3, "unit": "pieces", "category": "Produce"}]}
+- "swap oranges for mandarin oranges" -> {"action": "swap", "swap_from": "oranges", "swap_to": "mandarin oranges", "items": [{"name": "mandarin oranges", "quantity": 1, "unit": "pieces", "category": "Produce"}]}
+
+Return ONLY the JSON object, no other text."""
+
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_input)
+            ]
+            
+            if not self.chat_model:
+                state['inventory_response'] = "⚠️ Chat model not available. Cannot process inventory modification."
+                return state
+            
+            # Get LLM response
+            response = self.chat_model.invoke(messages)
+            response_text = response.content.strip()
+            
+            # Parse JSON from response
+            import json
+            import re
+            
+            # Try to extract JSON from the response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                parsed_data = json.loads(json_match.group())
+            else:
+                parsed_data = json.loads(response_text)
+            
+            action = parsed_data.get('action', 'add')
+            items = parsed_data.get('items', [])
+            swap_from = parsed_data.get('swap_from')
+            swap_to = parsed_data.get('swap_to')
+            
+            if not items and action != 'swap':
+                state['inventory_response'] = "❌ Could not understand what items to modify. Please be more specific."
+                return state
+            
+            # Process each item
+            success_messages = []
+            failed_items = []
+            
+            if action == 'swap' and swap_from and swap_to:
+                # Handle swap: remove old item, add new item
+                # First, try to find and remove the old item
+                cursor = self.conn.cursor()
+                try:
+                    cursor.execute("""
+                        SELECT inventory_id, quantity, unit, category
+                        FROM inventory
+                        WHERE user_id = %s AND LOWER(item_name) = LOWER(%s)
+                        LIMIT 1
+                    """, (user_id, swap_from))
+                    
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        old_inventory_id, old_quantity, old_unit, old_category = result
+                        
+                        # Delete the old item
+                        cursor.execute("DELETE FROM inventory WHERE inventory_id = %s", (old_inventory_id,))
+                        
+                        # Add the new item with same quantity
+                        new_item = items[0] if items else {}
+                        new_quantity = new_item.get('quantity', old_quantity)
+                        new_unit = new_item.get('unit', old_unit)
+                        new_category = new_item.get('category', old_category)
+                        
+                        success = add_inventory_item(
+                            self.conn,
+                            user_id,
+                            swap_to,
+                            new_quantity,
+                            new_unit,
+                            new_category
+                        )
+                        
+                        if success:
+                            success_messages.append(f"Swapped {swap_from} for {swap_to} ({new_quantity} {new_unit})")
+                        else:
+                            failed_items.append(f"Failed to add {swap_to}")
+                    else:
+                        failed_items.append(f"{swap_from} not found in inventory")
+                        
+                except Exception as e:
+                    failed_items.append(f"Swap error: {str(e)}")
+                finally:
+                    cursor.close()
+            else:
+                # Handle regular add/remove
+                for item in items:
+                    item_name = item.get('name')
+                    quantity = item.get('quantity', 1)
+                    unit = item.get('unit', 'pieces')
+                    category = item.get('category', 'Other')
+                    
+                    if action == 'add':
+                        # Add to inventory
+                        success = add_inventory_item(
+                            self.conn, 
+                            user_id, 
+                            item_name, 
+                            quantity, 
+                            unit, 
+                            category
+                        )
+                        if success:
+                            success_messages.append(f"Added {quantity} {unit} of {item_name}")
+                        else:
+                            failed_items.append(item_name)
+                    
+                    elif action == 'remove':
+                        # Remove from inventory (reduce quantity)
+                        success, new_qty, message = update_inventory_quantity(
+                            self.conn,
+                            user_id,
+                            item_name,
+                            -quantity  # Negative to subtract
+                        )
+                        if success:
+                            success_messages.append(message)
+                        else:
+                            failed_items.append(f"{item_name} ({message})")
+            
+            # Generate response
+            if success_messages:
+                state['inventory_response'] = "✅ " + "\n".join(success_messages)
+                state['inventory_result'] = {'status': 'success', 'items_modified': len(success_messages)}
+            elif failed_items:
+                state['inventory_response'] = f"❌ Failed to modify items: {', '.join(failed_items)}"
+                state['inventory_result'] = {'status': 'error', 'message': 'Database error'}
+            else:
+                state['inventory_response'] = "❌ No items were modified."
+                state['inventory_result'] = {'status': 'error', 'message': 'No items processed'}
+                
+        except json.JSONDecodeError as e:
+            state['inventory_response'] = f"❌ Error parsing inventory data: {str(e)}"
+            state['inventory_result'] = {'status': 'error', 'message': str(e)}
+        except Exception as e:
+            state['inventory_response'] = f"❌ Error updating inventory: {str(e)}"
+            state['inventory_result'] = {'status': 'error', 'message': str(e)}
+        
         return state
 
     # ==================== MONITORING NODE ====================
@@ -226,7 +417,6 @@ class MealRouterAgent:
         history = state['history']
         preferences = state.get('user_preferences', {})
         
-        # Format preferences for prompt
         pref_text = self.feedback_agent.format_preferences_for_prompt(preferences)
         
         system_prompt = f"""You are Meal Mind AI, a helpful nutrition and meal planning assistant.
@@ -254,28 +444,21 @@ YOUR ROLE:
 - IMPORTANT: Respect user dislikes and preferences in your suggestions
 """
         
-        # Prepare messages
         messages = [SystemMessage(content=system_prompt)]
-        
-        # Add history (last 5 messages)
-        # Filter history to ensure valid sequence (System -> User -> AI -> User...)
-        # specifically, we cannot have System -> AI. The first history msg must be Human.
         
         recent_history = history[-5:]
         start_index = 0
         
-        # Skip leading AI messages in the history chunk
         for i, msg in enumerate(recent_history):
             if isinstance(msg, HumanMessage):
                 start_index = i
                 break
             if i == len(recent_history) - 1:
-                start_index = len(recent_history) # Skip all if no HumanMessage found
+                start_index = len(recent_history)
         
         for msg in recent_history[start_index:]:
             messages.append(msg)
         
-        # Add current query
         messages.append(HumanMessage(content=state['user_input']))
         
         try:
@@ -329,7 +512,12 @@ Format the output using Markdown:
     def node_generate_response(self, state: ChatRouterState) -> ChatRouterState:
         """Generate final response using retrieved data if available"""
         
-        # Case 1: Adjustment Result
+        # Case 1: Inventory Modification Result
+        if state.get('inventory_response'):
+            state['response'] = state['inventory_response']
+            return state
+        
+        # Case 2: Adjustment Result
         if state.get('adjustment_result'):
             result = state['adjustment_result']
             warnings = state.get('monitoring_warnings', [])
@@ -354,7 +542,7 @@ Format the output using Markdown:
             state['response'] = response
             return state
 
-        # Case 2: Retrieved Meal Data
+        # Case 3: Retrieved Meal Data
         if state.get('retrieved_data'):
             user_profile = state['user_profile']
             
@@ -382,12 +570,10 @@ Generate a helpful, conversational response that:
                     response = self.chat_model.invoke(messages)
                     state['response'] = response.content
                 else:
-                    # Fallback to just showing the data
                     state['response'] = state['retrieved_data']
             except Exception as e:
                 state['response'] = state['retrieved_data']
         
-        # If response is already set from general_chat, keep it
         return state
     
     # ==================== CONDITIONAL EDGES ====================
@@ -399,6 +585,8 @@ Generate a helpful, conversational response that:
             return 'estimate_calories'
         elif state['route'] == 'meal_adjustment':
             return 'adjust_meal'
+        elif state['route'] == 'inventory_modification':
+            return 'modify_inventory'
         else:
             return 'general_chat'
     
@@ -407,23 +595,21 @@ Generate a helpful, conversational response that:
         """Build the LangGraph workflow with memory integration"""
         workflow = StateGraph(ChatRouterState)
         
-        # Add nodes
         workflow.add_node("load_preferences", self.node_load_preferences)
         workflow.add_node("extract_feedback", self.node_extract_feedback)
         workflow.add_node("route_query", self.node_route_query)
         workflow.add_node("retrieve_meals", self.node_retrieve_meals)
         workflow.add_node("estimate_calories", self.node_estimate_calories)
         workflow.add_node("adjust_meal", self.node_adjust_meal)
+        workflow.add_node("modify_inventory", self.node_modify_inventory)
         workflow.add_node("monitor_changes", self.node_monitor_changes)
         workflow.add_node("general_chat", self.node_general_chat)
         workflow.add_node("generate_response", self.node_generate_response)
         
-        # Add edges - Memory-aware workflow
         workflow.set_entry_point("load_preferences")
         workflow.add_edge("load_preferences", "extract_feedback")
         workflow.add_edge("extract_feedback", "route_query")
         
-        # Conditional routing after route_query
         workflow.add_conditional_edges(
             "route_query",
             self.should_retrieve_meals,
@@ -431,18 +617,15 @@ Generate a helpful, conversational response that:
                 "retrieve_meals": "retrieve_meals",
                 "estimate_calories": "estimate_calories",
                 "adjust_meal": "adjust_meal",
+                "modify_inventory": "modify_inventory",
                 "general_chat": "general_chat"
             }
         )
         
-        # Meal Adjustment Flow
         workflow.add_edge("adjust_meal", "monitor_changes")
         workflow.add_edge("monitor_changes", "generate_response")
-        
-        # Meal Retrieval Flow
+        workflow.add_edge("modify_inventory", "generate_response")
         workflow.add_edge("retrieve_meals", "generate_response")
-        
-        # End points
         workflow.add_edge("generate_response", END)
         workflow.add_edge("general_chat", END)
         workflow.add_edge("estimate_calories", END)
@@ -466,7 +649,9 @@ Generate a helpful, conversational response that:
             extracted_feedback=None,
             response="",
             adjustment_result=None,
-            monitoring_warnings=None
+            monitoring_warnings=None,
+            inventory_result=None,
+            inventory_response=None
         )
         
         app = self.build_graph()
@@ -477,11 +662,8 @@ Generate a helpful, conversational response that:
     def run_chat_stream(self, user_input: str, user_id: str, history: List[Any], context_data: Dict):
         """Stream the chat response word by word"""
         
-        # Get the full response first
         full_response = self.run_chat(user_input, user_id, history, context_data)
         
-        # Stream it word by word
         words = full_response.split()
         for i, word in enumerate(words):
             yield word + (" " if i < len(words) - 1 else "")
-
