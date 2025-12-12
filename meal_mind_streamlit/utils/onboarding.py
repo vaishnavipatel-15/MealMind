@@ -531,3 +531,4 @@ def profile_setup_wizard(conn, user_id):
                         st.error(f"Error: {e}")
                     finally:
                         cursor.close()
+                        
