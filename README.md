@@ -12,7 +12,7 @@ Meal Mind is a comprehensive Streamlit application designed to be your personali
 
 Over the past 3 months, Meal Mind has evolved from a simple concept into a sophisticated, enterprise-grade AI application.
 
-> **[📂 View Full Project Log (Google Drive)](INSERT_LINK_HERE)**
+> **[📂 View Full Project Log (Google Drive)](https://docs.google.com/document/d/1k9SJ9u5VmLKNf1oUglRbQRno43me8Wr3awU9wtEtHug/edit?usp=sharing)**
 
 ## 🌟 Key Features 
 
